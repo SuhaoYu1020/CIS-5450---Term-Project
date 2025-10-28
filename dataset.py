@@ -62,6 +62,16 @@ FINRATIO_FALLBACKS: List[Tuple[str, str]] = [
     ("wrdsapps", "firm_ratio")
 ]
 
+COMPUSTAT_FUNDA_FALLBACKS: List[Tuple[str, str]] = [
+    ("comp", "funda"),
+    ("comp_na_annual_all", "funda")
+]
+
+CRSP_STOCK_FALLBACKS: List[Tuple[str, str]] = [
+    ("crsp", "msf"),
+    ("crspa", "msf")
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="从 WRDS 抓取 CRSP IPO / Delist 数据")
@@ -109,7 +119,7 @@ def build_compustat_ipo_sql(library: str, table: str, exch_codes: List[int], sta
     # 尝试从 comp.company 获取 ipodate
     if table == "company":
         sql = f"""
-        SELECT
+        SELECT DISTINCT ON (crsp.permno)
             c.gvkey,
             c.conm AS comnam,
             crsp.ticker AS ticker,
@@ -130,12 +140,12 @@ def build_compustat_ipo_sql(library: str, table: str, exch_codes: List[int], sta
           AND c.ipodate BETWEEN '{start_date}' AND '{end_date}'
           AND crsp.shrcd IN (10, 11)
           AND crsp.exchcd IN ({exch_str})
-        ORDER BY c.ipodate
+        ORDER BY crsp.permno, c.ipodate
         """
     else:
         # 从 funda 获取 ipodate（年度数据）
         sql = f"""
-        SELECT DISTINCT ON (f.gvkey)
+        SELECT DISTINCT ON (crsp.permno)
             f.gvkey,
             f.conm AS comnam,
             crsp.ticker AS ticker,
@@ -156,7 +166,7 @@ def build_compustat_ipo_sql(library: str, table: str, exch_codes: List[int], sta
           AND f.ipodate BETWEEN '{start_date}' AND '{end_date}'
           AND crsp.shrcd IN (10, 11)
           AND crsp.exchcd IN ({exch_str})
-        ORDER BY f.gvkey, f.ipodate
+        ORDER BY crsp.permno, f.ipodate
         """
 
     if limit:
@@ -327,18 +337,56 @@ def build_financial_ratios_sql(
     table: str,
     permno: int,
     start_date: str,
-    end_date: str
+    end_date: str,
+    include_optional: bool = True
 ) -> str:
     """
-    构建查询财务比率的 SQL（ROA 和 ROE）
+    构建查询财务比率的 SQL（多个财务指标）
     从 wrdsapps.firm_ratio 表查询
+    包含: P/E, Market/Book, ROA, ROE, Net Profit Margin, Quick Ratio,
+         Debt/Equity, Current Ratio, Asset Turnover, Inventory Turnover,
+         以及计算 Tobin's Q 和增长率所需的字段
+
+    参数:
+        include_optional: 如果为 False，只查询核心字段
     """
-    sql = f"""
-    SELECT
+    # 核心字段（这些字段在 firm_ratio 中更有可能存在）
+    core_fields = """
         permno,
         public_date,
+        pe_op_basic,
+        pe_op_dil,
+        pe_exi,
+        pe_inc,
+        ptb,
+        bm,
         roa,
-        roe
+        roe,
+        npm,
+        quick_ratio,
+        de_ratio,
+        curr_ratio,
+        at_turn,
+        inv_turn
+    """
+
+    # 可选字段（用于计算 revenue_growth, total_asset_growth, tobins_q 等）
+    # 注意：tobins_q, revenue_growth, total_asset_growth 是计算字段，不直接查询
+    # 这里查询的是计算所需的基础字段
+    optional_fields = """
+        sale_equity,
+        sale_invcap,
+        revt_sale,
+        totdebt_invcap,
+        debt_invcap,
+        at
+    """
+
+    fields = core_fields + ("," + optional_fields if include_optional and optional_fields.strip() else "")
+
+    sql = f"""
+    SELECT
+        {fields}
     FROM {library}.{table}
     WHERE permno = {permno}
       AND public_date >= '{start_date}'
@@ -381,6 +429,154 @@ def get_continuous_years(df: pd.DataFrame, max_years: int = 5) -> pd.DataFrame:
     return result
 
 
+def calculate_revenue_growth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算 Revenue Growth
+    公式: Revenue Growth = (Revenue_t - Revenue_{t-1}) / Revenue_{t-1}
+
+    使用 revt_sale 字段作为 revenue 指标
+    如果 revt_sale 不可用，尝试使用 sale_equity 或 sale_invcap
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df = df.sort_values("public_date")
+
+    # 确定使用哪个 revenue 字段
+    revenue_col = None
+    if "revt_sale" in df.columns and df["revt_sale"].notna().any():
+        revenue_col = "revt_sale"
+    elif "sale_equity" in df.columns and df["sale_equity"].notna().any():
+        revenue_col = "sale_equity"
+    elif "sale_invcap" in df.columns and df["sale_invcap"].notna().any():
+        revenue_col = "sale_invcap"
+
+    if revenue_col is None:
+        # 没有可用的 revenue 字段，添加空列
+        df["revenue_growth"] = None
+        return df
+
+    # 计算 revenue growth
+    df["revenue_growth"] = df[revenue_col].pct_change()
+
+    return df
+
+
+def calculate_tobins_q(df: pd.DataFrame, db: "wrds.Connection", permno: int) -> pd.DataFrame:
+    """
+    处理 Tobin's Q 数据
+    如果 tobins_q 字段已存在且有值，直接使用
+    否则尝试手动计算: Tobin's Q = (Market Value of Equity + Debt) / Total Assets
+
+    注意：手动计算 Tobin's Q 需要获取市值和债务的绝对值，这比较复杂
+    因此优先使用数据库中已计算好的 tobins_q 字段
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    # 如果 tobins_q 已经存在且有数据，直接返回
+    if "tobins_q" in df.columns and df["tobins_q"].notna().any():
+        return df
+
+    # 如果没有 tobins_q，添加空列
+    # 手动计算 Tobin's Q 需要额外的市值数据，这里暂不实现
+    # 用户可以根据需要扩展此功能
+    if "tobins_q" not in df.columns:
+        df["tobins_q"] = None
+
+    return df
+
+
+def calculate_total_asset_growth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算 Total Asset Growth
+    公式: Total Asset Growth = (Total Assets_t - Total Assets_{t-1}) / Total Assets_{t-1}
+
+    使用 total_assets 字段
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df = df.sort_values("public_date")
+
+    if "total_assets" not in df.columns or not df["total_assets"].notna().any():
+        # 没有可用的 total_assets 字段，添加空列
+        df["total_asset_growth"] = None
+        return df
+
+    # 计算 total asset growth
+    df["total_asset_growth"] = df["total_assets"].pct_change()
+
+    return df
+
+
+def build_compustat_total_assets_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 Compustat funda 表获取 Total Assets (at 字段)
+    通过 ccmxpf_lnkhist 链接 permno 和 gvkey
+    """
+    sql = f"""
+    SELECT
+        lnk.lpermno AS permno,
+        f.datadate AS public_date,
+        f.at AS total_assets
+    FROM {library}.{table} AS f
+    JOIN crsp.ccmxpf_lnkhist AS lnk
+      ON f.gvkey = lnk.gvkey
+     AND lnk.linktype IN ('LU', 'LC')
+     AND lnk.linkprim IN ('P', 'C')
+     AND f.datadate >= lnk.linkdt
+     AND (f.datadate <= lnk.linkenddt OR lnk.linkenddt IS NULL)
+    WHERE lnk.lpermno = {permno}
+      AND f.datadate >= '{start_date}'
+      AND f.datadate <= '{end_date}'
+      AND f.indfmt = 'INDL'
+      AND f.datafmt = 'STD'
+      AND f.popsrc = 'D'
+      AND f.consol = 'C'
+      AND f.at IS NOT NULL
+    ORDER BY f.datadate
+    """
+    return sql
+
+
+def fetch_total_assets_from_compustat(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    """
+    从 Compustat 获取 Total Assets 数据作为后备方案
+    """
+    for library, table in COMPUSTAT_FUNDA_FALLBACKS:
+        try:
+            sql = build_compustat_total_assets_sql(
+                library, table, permno, start_date, end_date
+            )
+            print(f"    尝试 {library}.{table} ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ 找到 {len(df)} 条记录")
+                return df
+            else:
+                print(f"    ✗ 无记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
+
+
 def fetch_financial_data_for_ipo(
     db: "wrds.Connection",
     ipo_df: pd.DataFrame
@@ -406,34 +602,89 @@ def fetch_financial_data_for_ipo(
         # 尝试从不同的表查询
         df_financial = None
         for library, table in FINRATIO_FALLBACKS:
+            # 查询核心字段和可选字段（用于后续计算）
             try:
                 sql = build_financial_ratios_sql(
                     library,
                     table,
                     permno,
                     ipo_date.strftime("%Y-%m-%d"),
-                    end_date.strftime("%Y-%m-%d")
+                    end_date.strftime("%Y-%m-%d"),
+                    include_optional=True
                 )
+                print(f"  尝试查询 {library}.{table}，日期范围: {ipo_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}")
                 df_temp = db.raw_sql(sql)
 
                 if not df_temp.empty:
                     df_financial = df_temp
-                    print(f"  从 {library}.{table} 找到 {len(df_temp)} 条记录")
+                    print(f"  ✓ 从 {library}.{table} 找到 {len(df_temp)} 条记录")
                     break
+                else:
+                    print(f"  ✗ {library}.{table} 返回0条记录")
             except Exception as err:
-                print(f"  查询 {library}.{table} 失败: {err}")
+                print(f"  ✗ 查询 {library}.{table} 失败: {err}")
                 continue
 
         if df_financial is None or df_financial.empty:
-            print(f"  未找到财务数据")
+            print(f"  ⚠ 未找到财务数据，可能原因：")
+            print(f"    - permno {permno} 在 {library}.{table} 中无记录")
+            print(f"    - IPO 日期 {ipo_date.date()} 太早，数据库可能不包含该时期数据")
             continue
+
+        # 如果查询结果中有 at 字段，重命名为 total_assets
+        if "at" in df_financial.columns:
+            df_financial = df_financial.rename(columns={"at": "total_assets"})
+
+        # 添加缺失的计算字段为空列（这些字段需要后续计算）
+        calculated_cols = ["tobins_q", "revenue_growth", "total_asset_growth"]
+        for col in calculated_cols:
+            if col not in df_financial.columns:
+                df_financial[col] = None
+
+        # 检查是否有 total_assets 字段，如果没有则从 Compustat 获取
+        if "total_assets" not in df_financial.columns or not df_financial["total_assets"].notna().any():
+            print(f"  → firm_ratio 中无 total_assets，尝试从 Compustat 获取...")
+            df_total_assets = fetch_total_assets_from_compustat(
+                db,
+                permno,
+                ipo_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d")
+            )
+
+            if df_total_assets is not None and not df_total_assets.empty:
+                print(f"  ✓ 从 Compustat 获取到 {len(df_total_assets)} 条 total_assets 记录")
+                # 合并 total_assets 数据到 df_financial
+                # 如果 total_assets 列已存在，先删除它
+                if "total_assets" in df_financial.columns:
+                    df_financial = df_financial.drop(columns=["total_assets"])
+
+                # 使用 public_date 作为合并键
+                df_financial = pd.merge(
+                    df_financial,
+                    df_total_assets[["public_date", "total_assets"]],
+                    on="public_date",
+                    how="left"
+                )
+            else:
+                print(f"  ✗ 从 Compustat 也未获取到 total_assets")
 
         # 获取连续年份的数据（最多5年）
         df_continuous = get_continuous_years(df_financial, max_years=5)
 
         if df_continuous.empty:
-            print(f"  无连续年份数据")
+            print(f"  ⚠ 无连续年份数据")
             continue
+
+        print(f"  ✓ 获得 {len(df_continuous)} 条连续年份数据")
+
+        # 处理 Tobin's Q
+        df_continuous = calculate_tobins_q(df_continuous, db, permno)
+
+        # 计算 Revenue Growth
+        df_continuous = calculate_revenue_growth(df_continuous)
+
+        # 计算 Total Asset Growth
+        df_continuous = calculate_total_asset_growth(df_continuous)
 
         # 添加 IPO 相关信息
         df_continuous["ipo_date"] = ipo_date
@@ -453,7 +704,18 @@ def fetch_financial_data_for_ipo(
     final_df = pd.concat(all_results, ignore_index=True)
 
     # 重新排列列顺序
-    cols = ["permno", "ipo_date", "public_date", "roa", "roe"]
+    cols = [
+        "permno", "ipo_date", "public_date",
+        "pe_op_basic", "pe_op_dil", "pe_exi", "pe_inc",  # P/E ratios
+        "ptb", "bm",  # Market/Book
+        "roa", "roe",  # ROA and ROE
+        "npm",  # Net Profit Margin
+        "tobins_q",  # Tobin's Q
+        "revenue_growth",  # Revenue Growth
+        "total_asset_growth",  # Total Asset Growth
+        "quick_ratio", "de_ratio", "curr_ratio",  # Liquidity and leverage ratios
+        "at_turn", "inv_turn"  # Turnover ratios
+    ]
     # 添加其他列
     for col in final_df.columns:
         if col not in cols:

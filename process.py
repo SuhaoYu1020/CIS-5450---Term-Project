@@ -179,21 +179,21 @@ if __name__ == "__main__":
         "--ipo-path",
         dest="ipo_path",
         type=str,
-        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/ipo_1974_2024_3.xlsx",
+        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/ipo_1974_2024_2.xlsx",
         help="IPO 数据文件路径（.xlsx 或 .csv）",
     )
     parser.add_argument(
         "--delist-path",
         dest="delist_path",
         type=str,
-        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/delist_1974_2024_3.xlsx",
+        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/delist_1974_2024_2.xlsx",
         help="退市数据文件路径（.xlsx 或 .csv）",
     )
     parser.add_argument(
         "--output-path",
         dest="output_path",
         type=str,
-        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/ipo_delist_within5y_1974_2024_3.xlsx",
+        default="/Users/ethanyu/Documents/Upenn/Courses/25Fall/CIS5450/Final/term project/CIS-5450---Term-Project/ipo_delist_within5y_1974_2024_2.xlsx",
         help="输出保存路径（.xlsx 或 .csv，可选）",
     )
     parser.add_argument(
