@@ -67,9 +67,26 @@ COMPUSTAT_FUNDA_FALLBACKS: List[Tuple[str, str]] = [
     ("comp_na_annual_all", "funda")
 ]
 
+# Compustat 季度表（fundq）回退顺序：优先使用 compd，再回退到 comp
+COMPUSTAT_FUNDQ_FALLBACKS: List[Tuple[str, str]] = [
+    ("compd", "fundq"),
+    ("comp", "fundq")
+]
+
 CRSP_STOCK_FALLBACKS: List[Tuple[str, str]] = [
     ("crsp", "msf"),
     ("crspa", "msf")
+]
+
+# CCM + Compustat 融合表（用于 prcc_c / pstk）
+CRSP_CCM_FUNDA_FALLBACKS: List[Tuple[str, str]] = [
+    ("crspa", "ccmfunda"),
+]
+
+# Compustat 年度表，作为 prcc_c / pstk 的后备来源
+COMPUSTAT_ANNUAL_FALLBACKS_FOR_PRICE: List[Tuple[str, str]] = [
+    ("compd", "funda"),
+    ("comp", "funda"),
 ]
 
 
@@ -370,17 +387,9 @@ def build_financial_ratios_sql(
         inv_turn
     """
 
-    # 可选字段（用于计算 revenue_growth, total_asset_growth, tobins_q 等）
-    # 注意：tobins_q, revenue_growth, total_asset_growth 是计算字段，不直接查询
-    # 这里查询的是计算所需的基础字段
-    optional_fields = """
-        sale_equity,
-        sale_invcap,
-        revt_sale,
-        totdebt_invcap,
-        debt_invcap,
-        at
-    """
+    # 可选字段：为避免 firm_ratio 中不存在的列导致查询失败，这里不再请求
+    # 收入将通过 comp/compd.fundq 的 revtq 获取；资产通过 comp.funda 回退获取
+    optional_fields = ""
 
     fields = core_fields + ("," + optional_fields if include_optional and optional_fields.strip() else "")
 
@@ -434,8 +443,8 @@ def calculate_revenue_growth(df: pd.DataFrame) -> pd.DataFrame:
     计算 Revenue Growth
     公式: Revenue Growth = (Revenue_t - Revenue_{t-1}) / Revenue_{t-1}
 
-    使用 revt_sale 字段作为 revenue 指标
-    如果 revt_sale 不可用，尝试使用 sale_equity 或 sale_invcap
+    优先使用 Compustat 季度收入 revtq（来自 fundq）按季度计算；
+    若 revtq 缺失，则回退到 firm_ratio 中的 revt_sale/sale_equity/sale_invcap。
     """
     if df.empty:
         return df
@@ -443,24 +452,54 @@ def calculate_revenue_growth(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.sort_values("public_date")
 
-    # 确定使用哪个 revenue 字段
+    # 确定使用哪个 revenue 字段（优先 revtq）
     revenue_col = None
-    if "revt_sale" in df.columns and df["revt_sale"].notna().any():
+    if "revtq" in df.columns and df["revtq"].notna().any():
+        revenue_col = "revtq"
+    elif "revt_sale" in df.columns and df["revt_sale"].notna().any():
         revenue_col = "revt_sale"
     elif "sale_equity" in df.columns and df["sale_equity"].notna().any():
         revenue_col = "sale_equity"
     elif "sale_invcap" in df.columns and df["sale_invcap"].notna().any():
         revenue_col = "sale_invcap"
 
+    print(f"revenue_col: {revenue_col}")
     if revenue_col is None:
         # 没有可用的 revenue 字段，添加空列
         df["revenue_growth"] = None
         return df
 
-    # 计算 revenue growth
-    df["revenue_growth"] = df[revenue_col].pct_change()
+    # 仅在 revenue 非空的行计算增长，相对上一个非空值
+    growth = df.loc[df[revenue_col].notna(), revenue_col].pct_change()
+    df["revenue_growth"] = None
+    df.loc[growth.index, "revenue_growth"] = growth
 
     return df
+
+
+def get_continuous_quarters(df: pd.DataFrame, max_quarters: int = 20) -> pd.DataFrame:
+    """
+    获取连续的季度数据，最多 max_quarters 个季度（默认 5 年 * 4 季度）。
+    连续性基于 public_date 的季度周期（to_period('Q')）。
+    """
+    if df.empty:
+        return df
+
+    df = df.sort_values("public_date").copy()
+    periods = pd.to_datetime(df["public_date"]).dt.to_period("Q")
+    unique_periods = periods.drop_duplicates().sort_values().tolist()
+    if not unique_periods:
+        return df.iloc[0:0]
+
+    continuous = [unique_periods[0]]
+    for i in range(1, min(len(unique_periods), max_quarters)):
+        if unique_periods[i] == continuous[-1] + 1:
+            continuous.append(unique_periods[i])
+        else:
+            break
+
+    mask = periods.isin(continuous)
+    return df.loc[mask].copy()
 
 
 def calculate_tobins_q(df: pd.DataFrame, db: "wrds.Connection", permno: int) -> pd.DataFrame:
@@ -512,6 +551,164 @@ def calculate_total_asset_growth(df: pd.DataFrame) -> pd.DataFrame:
     df["total_asset_growth"] = df["total_assets"].pct_change()
 
     return df
+
+
+def build_ccmfunda_price_pstk_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 crspa.ccmfunda 获取 prcc_c（价格）和 pstk（优先股），按年度（datadate）
+    通过 ccmxpf_lnkhist 将 gvkey 映射为 permno。
+    """
+    sql = f"""
+    SELECT
+        lnk.lpermno AS permno,
+        f.datadate AS public_date,
+        f.prcc_c,
+        f.pstk
+    FROM {library}.{table} AS f
+    JOIN crsp.ccmxpf_lnkhist AS lnk
+      ON f.gvkey = lnk.gvkey
+     AND lnk.linktype IN ('LU', 'LC')
+     AND lnk.linkprim IN ('P', 'C')
+     AND f.datadate >= lnk.linkdt
+     AND (f.datadate <= lnk.linkenddt OR lnk.linkenddt IS NULL)
+    WHERE lnk.lpermno = {permno}
+      AND f.datadate >= '{start_date}'
+      AND f.datadate <= '{end_date}'
+      -- 不限制 prcc_c 非空，以免过滤掉含 pstk 的记录
+    ORDER BY f.datadate
+    """
+    return sql
+
+
+def fetch_ccmfunda_price_pstk(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    for library, table in CRSP_CCM_FUNDA_FALLBACKS:
+        try:
+            sql = build_ccmfunda_price_pstk_sql(library, table, permno, start_date, end_date)
+            print(f"  → 尝试 {library}.{table} 获取 prcc_c/pstk ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ {len(df)} 条 prcc_c/pstk 记录")
+                return df
+            else:
+                print("    ✗ 无 prcc_c/pstk 记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
+
+
+def build_compustat_price_pstk_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 compd/comp.funda 获取 prcc_c 与 pstk（年度），通过 ccmxpf_lnkhist 关联 permno。
+    """
+    sql = f"""
+    SELECT
+        lnk.lpermno AS permno,
+        f.datadate AS public_date,
+        f.prcc_c,
+        f.pstk
+    FROM {library}.{table} AS f
+    JOIN crsp.ccmxpf_lnkhist AS lnk
+      ON f.gvkey = lnk.gvkey
+     AND lnk.linktype IN ('LU', 'LC')
+     AND lnk.linkprim IN ('P', 'C')
+     AND f.datadate >= lnk.linkdt
+     AND (f.datadate <= lnk.linkenddt OR lnk.linkenddt IS NULL)
+    WHERE lnk.lpermno = {permno}
+      AND f.datadate >= '{start_date}'
+      AND f.datadate <= '{end_date}'
+      AND f.indfmt = 'INDL'
+      AND f.datafmt = 'STD'
+      AND f.popsrc = 'D'
+      AND f.consol = 'C'
+    ORDER BY f.datadate
+    """
+    return sql
+
+
+def fetch_compustat_price_pstk(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    for library, table in COMPUSTAT_ANNUAL_FALLBACKS_FOR_PRICE:
+        try:
+            sql = build_compustat_price_pstk_sql(library, table, permno, start_date, end_date)
+            print(f"  → 尝试 {library}.{table} 获取 prcc_c/pstk ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ {len(df)} 条 prcc_c/pstk 记录")
+                return df
+            else:
+                print("    ✗ 无 prcc_c/pstk 记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
+
+
+def build_msf_shrout_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 CRSP 月度收益表 msf 获取 shrout（月度，千股）。
+    """
+    sql = f"""
+    SELECT
+        permno,
+        date AS public_date,
+        shrout
+    FROM {library}.{table}
+    WHERE permno = {permno}
+      AND date >= '{start_date}'
+      AND date <= '{end_date}'
+    ORDER BY date
+    """
+    return sql
+
+
+def fetch_msf_shrout(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    for library, table in CRSP_STOCK_FALLBACKS:
+        try:
+            sql = build_msf_shrout_sql(library, table, permno, start_date, end_date)
+            print(f"  → 尝试 {library}.{table} 获取 shrout ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ {len(df)} 条 shrout 记录")
+                return df
+            else:
+                print("    ✗ 无 shrout 记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
 
 
 def build_compustat_total_assets_sql(
@@ -577,6 +774,186 @@ def fetch_total_assets_from_compustat(
     return None
 
 
+def build_compustat_total_liabilities_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 Compustat 年度 funda 表获取 Total Liabilities (lt 字段，单位：百万美元)
+    通过 ccmxpf_lnkhist 链接 permno 和 gvkey。
+    """
+    sql = f"""
+    SELECT
+        lnk.lpermno AS permno,
+        f.datadate AS public_date,
+        f.lt AS total_liabilities
+    FROM {library}.{table} AS f
+    JOIN crsp.ccmxpf_lnkhist AS lnk
+      ON f.gvkey = lnk.gvkey
+     AND lnk.linktype IN ('LU', 'LC')
+     AND lnk.linkprim IN ('P', 'C')
+     AND f.datadate >= lnk.linkdt
+     AND (f.datadate <= lnk.linkenddt OR lnk.linkenddt IS NULL)
+    WHERE lnk.lpermno = {permno}
+      AND f.datadate >= '{start_date}'
+      AND f.datadate <= '{end_date}'
+      AND f.indfmt = 'INDL'
+      AND f.datafmt = 'STD'
+      AND f.popsrc = 'D'
+      AND f.consol = 'C'
+      AND f.lt IS NOT NULL
+    ORDER BY f.datadate
+    """
+    return sql
+
+
+def fetch_total_liabilities_from_compustat(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    for library, table in [("compd", "funda"), ("comp", "funda")]:
+        try:
+            sql = build_compustat_total_liabilities_sql(
+                library, table, permno, start_date, end_date
+            )
+            print(f"    尝试 {library}.{table} (lt) ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ 找到 {len(df)} 条 total_liabilities 记录")
+                return df
+            else:
+                print("    ✗ 无 total_liabilities 记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
+
+
+def calculate_tobinq(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算 Tobin's Q（年度口径，保留月度行；非年报月置为 NaN）
+    公式：tobinq = (shrout*prcc_c + pstk + total_liabilities) / total_assets
+
+    - shrout 来自 CRSP msf，单位通常为千股，这里转换为股（*1000）
+    - prcc_c、pstk 来自 ccmfunda（Compustat/CRSP 合并表）
+    - total_liabilities (lt) 与 total_assets (at) 为百万美元口径
+    - 为保证口径一致，shrout*prcc_c 结果从美元转换为百万美元（/1e6）
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    # 转换 shrout 为股，并将市值转换为百万美元
+    if "shrout" in df.columns:
+        df["shrout_shares"] = df["shrout"] * 1000.0
+    else:
+        df["shrout_shares"] = None
+
+    # 仅在四个组成项齐备时计算
+    def _calc_row(row: pd.Series) -> Optional[float]:
+        try:
+            prcc_c = row.get("prcc_c")
+            pstk = row.get("pstk")
+            total_liabilities = row.get("total_liabilities")
+            total_assets = row.get("total_assets")
+            shrout_shares = row.get("shrout_shares")
+            if pd.isna(prcc_c) or pd.isna(total_assets) or pd.isna(shrout_shares):
+                return None
+            # 市值（百万美元）
+            market_equity_m = (shrout_shares * prcc_c) / 1_000_000.0
+            # pstk 与 lt 已是百万美元
+            if pd.isna(pstk):
+                pstk_val = 0.0
+            else:
+                pstk_val = pstk
+            if pd.isna(total_liabilities):
+                tl_val = 0.0
+            else:
+                tl_val = total_liabilities
+            numerator = market_equity_m + pstk_val + tl_val
+            if pd.isna(total_assets) or total_assets == 0:
+                return None
+            return float(numerator) / float(total_assets)
+        except Exception:
+            return None
+
+    df["tobinq"] = df.apply(_calc_row, axis=1)
+    # 清理临时列
+    if "shrout_shares" in df.columns:
+        df = df.drop(columns=["shrout_shares"])
+    return df
+
+
+def build_compustat_quarterly_revenue_sql(
+    library: str,
+    table: str,
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> str:
+    """
+    从 Compustat fundq 表获取季度收入 revtq，
+    通过 ccmxpf_lnkhist 将 gvkey 映射到 permno。
+    使用 datadate 作为 public_date。
+    """
+    sql = f"""
+    SELECT
+        lnk.lpermno AS permno,
+        q.datadate AS public_date,
+        q.revtq AS revtq
+    FROM {library}.{table} AS q
+    JOIN crsp.ccmxpf_lnkhist AS lnk
+      ON q.gvkey = lnk.gvkey
+     AND lnk.linktype IN ('LU', 'LC')
+     AND lnk.linkprim IN ('P', 'C')
+     AND q.datadate >= lnk.linkdt
+     AND (q.datadate <= lnk.linkenddt OR lnk.linkenddt IS NULL)
+    WHERE lnk.lpermno = {permno}
+      AND q.datadate >= '{start_date}'
+      AND q.datadate <= '{end_date}'
+      AND q.indfmt = 'INDL'
+      AND q.datafmt = 'STD'
+      AND q.popsrc = 'D'
+      AND q.consol = 'C'
+      AND q.revtq IS NOT NULL
+    ORDER BY q.datadate
+    """
+    return sql
+
+
+def fetch_quarterly_revenue_from_compustat(
+    db: "wrds.Connection",
+    permno: int,
+    start_date: str,
+    end_date: str
+) -> Optional[pd.DataFrame]:
+    """
+    从 Compustat fundq 获取季度收入 revtq。
+    """
+    for library, table in COMPUSTAT_FUNDQ_FALLBACKS:
+        try:
+            sql = build_compustat_quarterly_revenue_sql(
+                library, table, permno, start_date, end_date
+            )
+            print(f"    尝试 {library}.{table} (revtq) ...")
+            df = db.raw_sql(sql)
+            if not df.empty:
+                print(f"    ✓ 找到 {len(df)} 条季度收入记录")
+                return df
+            else:
+                print(f"    ✗ 无季度收入记录")
+        except Exception as err:
+            print(f"    ✗ 查询失败: {err}")
+            continue
+    return None
+
+
 def fetch_financial_data_for_ipo(
     db: "wrds.Connection",
     ipo_df: pd.DataFrame
@@ -636,7 +1013,7 @@ def fetch_financial_data_for_ipo(
             df_financial = df_financial.rename(columns={"at": "total_assets"})
 
         # 添加缺失的计算字段为空列（这些字段需要后续计算）
-        calculated_cols = ["tobins_q", "revenue_growth", "total_asset_growth"]
+        calculated_cols = ["revenue_growth", "total_asset_growth"]
         for col in calculated_cols:
             if col not in df_financial.columns:
                 df_financial[col] = None
@@ -668,19 +1045,111 @@ def fetch_financial_data_for_ipo(
             else:
                 print(f"  ✗ 从 Compustat 也未获取到 total_assets")
 
-        # 获取连续年份的数据（最多5年）
+        # 获取季度收入 revtq，并合并到 df_financial（作为季度增长的基础）
+        print(f"  → 尝试从 Compustat fundq 获取季度收入 revtq ...")
+        df_revenue_q = fetch_quarterly_revenue_from_compustat(
+            db,
+            permno,
+            ipo_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        if df_revenue_q is not None and not df_revenue_q.empty:
+            # 以月度财报为基表，左连接季度收入；非季度月份的 revtq 将为 NaN
+            df_financial = pd.merge(
+                df_financial,
+                df_revenue_q,
+                on=["permno", "public_date"],
+                how="left"
+            )
+        else:
+            print(f"  ⚠ 未能获取 revtq，将回退到 firm_ratio 提供的收入字段（若有）")
+
+        # 获取连续年份范围内的月度数据（最多5年），保留月度频率
         df_continuous = get_continuous_years(df_financial, max_years=5)
 
         if df_continuous.empty:
             print(f"  ⚠ 无连续年份数据")
             continue
 
-        print(f"  ✓ 获得 {len(df_continuous)} 条连续年份数据")
+        print(f"  ✓ 获得 {len(df_continuous)} 条连续时间数据（按月度保留）")
 
-        # 处理 Tobin's Q
-        df_continuous = calculate_tobins_q(df_continuous, db, permno)
+        # 合并年度 prcc_c/pstk、总负债 lt（百万美元），以及月度 shrout（千股）
+        # 统一到“月份末”以避免日期不对齐导致的空值
+        df_continuous = df_continuous.copy()
+        df_continuous["merge_month"] = pd.to_datetime(df_continuous["public_date"]).dt.to_period("M").dt.to_timestamp("M")
+        # 先尝试 ccmfunda，其次回退 compd/comp.funda
+        prices_df = fetch_ccmfunda_price_pstk(
+            db,
+            permno,
+            ipo_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        if (prices_df is None) or prices_df.empty:
+            prices_df = fetch_compustat_price_pstk(
+                db,
+                permno,
+                ipo_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d")
+            )
+        if prices_df is not None and not prices_df.empty:
+            prices_df = prices_df.copy()
+            prices_df["merge_month"] = pd.to_datetime(prices_df["public_date"]).dt.to_period("M").dt.to_timestamp("M")
+            df_continuous = pd.merge(
+                df_continuous,
+                prices_df[["merge_month", "prcc_c", "pstk"]],
+                on="merge_month",
+                how="left"
+            )
 
-        # 计算 Revenue Growth
+        liabilities_df = fetch_total_liabilities_from_compustat(
+            db,
+            permno,
+            ipo_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        if liabilities_df is not None and not liabilities_df.empty:
+            liabilities_df = liabilities_df.copy()
+            liabilities_df["merge_month"] = pd.to_datetime(liabilities_df["public_date"]).dt.to_period("M").dt.to_timestamp("M")
+            df_continuous = pd.merge(
+                df_continuous,
+                liabilities_df[["merge_month", "total_liabilities"]],
+                on="merge_month",
+                how="left"
+            )
+
+        shrout_df = fetch_msf_shrout(
+            db,
+            permno,
+            ipo_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        if shrout_df is not None and not shrout_df.empty:
+            shrout_df = shrout_df.copy()
+            shrout_df["merge_month"] = pd.to_datetime(shrout_df["public_date"]).dt.to_period("M").dt.to_timestamp("M")
+            df_continuous = pd.merge(
+                df_continuous,
+                shrout_df[["merge_month", "shrout"]],
+                on="merge_month",
+                how="left"
+            )
+
+        # 确保 TobinQ 相关列存在（即使本公司未取到对应数据，后续也能安全重排列）
+        for _col in ["prcc_c", "pstk", "shrout", "total_liabilities"]:
+            if _col not in df_continuous.columns:
+                df_continuous[_col] = pd.NA
+
+        # 清理合并辅助列
+        if "merge_month" in df_continuous.columns:
+            df_continuous = df_continuous.drop(columns=["merge_month"])
+
+        # 如果存在旧列 tobins_q，删除避免重复
+        if "tobins_q" in df_continuous.columns:
+            df_continuous = df_continuous.drop(columns=["tobins_q"])
+
+        # 计算新的 TobinQ（年度计算、月度保留，非年报月为 NaN）
+        df_continuous = calculate_tobinq(df_continuous)
+
+        # 计算 Revenue Growth（仅在季度末非空处计算，对应上一季度非空值）
         df_continuous = calculate_revenue_growth(df_continuous)
 
         # 计算 Total Asset Growth
@@ -706,11 +1175,13 @@ def fetch_financial_data_for_ipo(
     # 重新排列列顺序
     cols = [
         "permno", "ipo_date", "public_date",
+        "revtq",  # Quarterly revenue
+        "prcc_c", "pstk", "shrout", "total_liabilities",  # TobinQ 组成项
         "pe_op_basic", "pe_op_dil", "pe_exi", "pe_inc",  # P/E ratios
         "ptb", "bm",  # Market/Book
         "roa", "roe",  # ROA and ROE
         "npm",  # Net Profit Margin
-        "tobins_q",  # Tobin's Q
+        "tobinq",  # 新的 Tobin's Q
         "revenue_growth",  # Revenue Growth
         "total_asset_growth",  # Total Asset Growth
         "quick_ratio", "de_ratio", "curr_ratio",  # Liquidity and leverage ratios
@@ -721,6 +1192,10 @@ def fetch_financial_data_for_ipo(
         if col not in cols:
             cols.append(col)
 
+    # 在重排列前，确保所有期望列都存在；不存在的补为 NaN，避免 KeyError
+    for _col in cols:
+        if _col not in final_df.columns:
+            final_df[_col] = pd.NA
     final_df = final_df[cols]
 
     return final_df
