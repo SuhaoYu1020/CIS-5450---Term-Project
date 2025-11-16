@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-# 确保项目根目录在 sys.path 中，便于 `python src/main.py` 方式运行能找到 `models`
+# Ensure project root is in sys.path so `python src/main.py` can find `models`
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
 if _PROJECT_ROOT not in sys.path:
@@ -19,7 +19,7 @@ from models.logistic_regression import build_model_from_params
 
 
 def _base_monthly_feature_names() -> List[str]:
-    """原始月度层面的基础财务字段名（16 个）。"""
+    """Base monthly financial feature names (16 features)."""
     return [
         "revtq",
         "pe_op_basic",
@@ -45,7 +45,7 @@ def infer_time_column(columns: Iterable[str]) -> str:
     for c in candidates:
         if c in columns:
             return c
-    raise ValueError("未能找到年份列，请通过 --time_col 指定（例如 year 或 fyear）。")
+    raise ValueError("Could not find year column. Please specify via --time_col (e.g., year or fyear).")
 
 
 def infer_label_column(columns: Iterable[str]) -> str:
@@ -53,20 +53,20 @@ def infer_label_column(columns: Iterable[str]) -> str:
     for c in candidates:
         if c in columns:
             return c
-    raise ValueError("未能找到标签列（是否退市）。请通过 --label_col 指定（如 delist）。")
+    raise ValueError("Could not find label column (delist indicator). Please specify via --label_col (e.g., delist).")
 
 
 def default_feature_list() -> List[str]:
-    # 来自截图推断的常见财务指标名称；主程序会与实际列名求交集
+    # Common financial indicator names inferred from screenshots; main program will intersect with actual column names
     return _base_monthly_feature_names()
 
 
 def default_yearly_aggregated_feature_list() -> List[str]:
-    """年度聚合后的默认特征列表（用于“用今年预测下一年”）。
-    - 所有基础变量的 last 与 mean
-    - 波动性 std（仅用于几个比率/周转类）
-    - 年内趋势 slope（用于盈利/规模代表性变量）
-    - 披露次数 obs_count_in_year
+    """Default feature list after yearly aggregation (for "predict next year using current year").
+    - last and mean for all base variables
+    - volatility std (only for ratio/turnover types)
+    - within-year trend slope (for profitability/scale representative variables)
+    - observation count obs_count_in_year
     """
     base = _base_monthly_feature_names()
     base_last = [f"{c}_last" for c in base]
@@ -81,39 +81,39 @@ def default_yearly_aggregated_feature_list() -> List[str]:
 def build_yearly_from_monthly(
     df: pd.DataFrame, cutoff_month: Optional[int] = None
 ) -> pd.DataFrame:
-    """从月度数据聚合到年度，并生成下一年标签 y_next_year。
-    仅使用当年信息构造年度特征；可选按 cutoff_month 截止，避免“年末”潜在信息泄漏。
+    """Aggregate monthly data to yearly and generate next year label y_next_year.
+    Only uses current year information to construct yearly features; optionally cutoff by cutoff_month to avoid potential information leakage at year-end.
     """
-    assert "permno" in df.columns, "数据缺少公司标识列 permno"
+    assert "permno" in df.columns, "Data missing company identifier column permno"
     year_col = "public_year" if "public_year" in df.columns else infer_time_column(df.columns)
     month_col = "public_month"
     features = [c for c in _base_monthly_feature_names() if c in df.columns]
 
     dfw = df.copy()
     if month_col not in dfw.columns:
-        # 无月份信息则视作 12 月（年末），依然可进行“last/mean”等聚合
+        # If no month info, treat as December (year-end), still can perform "last/mean" aggregation
         dfw[month_col] = 12
-    # 只保留需要的列，避免 groupby 额外负担
+    # Keep only needed columns to avoid groupby overhead
     keep_cols = list(dict.fromkeys(["permno", year_col, month_col, "delist"] + features))
     dfw = dfw[keep_cols]
 
-    # 数值化并清理 inf
+    # Convert to numeric and clean inf
     for c in features:
         dfw[c] = pd.to_numeric(dfw[c], errors="coerce")
     dfw = dfw.replace([np.inf, -np.inf], np.nan)
 
-    # 可选：年度内仅保留截止月份之前的数据
+    # Optional: only keep data before cutoff month within the year
     if cutoff_month is not None:
         dfw = dfw[dfw[month_col] <= int(cutoff_month)]
 
-    # 排序
+    # Sort
     dfw = dfw.sort_values(["permno", year_col, month_col], kind="mergesort")
 
-    # 年度聚合：last/mean/std/斜率/观测次数
+    # Yearly aggregation: last/mean/std/slope/observation count
     # last/mean
     last_vals = dfw.groupby(["permno", year_col], as_index=True)[features].last().add_suffix("_last")
     mean_vals = dfw.groupby(["permno", year_col], as_index=True)[features].mean().add_suffix("_mean")
-    # std（只计算子集）
+    # std (only compute subset)
     std_cols = [c for c in ["quick_ratio", "de_ratio", "curr_ratio", "at_turn", "inv_turn"] if c in features]
     std_vals = (
         dfw.groupby(["permno", year_col], as_index=True)[std_cols].std().add_suffix("_std")
@@ -121,7 +121,7 @@ def build_yearly_from_monthly(
         else pd.DataFrame(index=last_vals.index)
     )
 
-    # 斜率（对月份序列做最小二乘，中心化后的简单一元回归）
+    # Slope (least squares on month sequence, simple univariate regression after centering)
     slope_cols = [c for c in ["revtq", "roa", "roe", "npm", "tobinq"] if c in features]
 
     def slope_per_group(g: pd.DataFrame, cols: List[str]) -> pd.Series:
@@ -140,7 +140,7 @@ def build_yearly_from_monthly(
         return pd.Series(out)
 
     if slope_cols:
-        # 仅选择计算所需列，避免 pandas 对分组列的 apply 行为变更带来的警告
+        # Only select columns needed for computation to avoid pandas apply behavior change warnings on grouping columns
         slopes = (
             dfw.groupby(["permno", year_col])[[month_col] + slope_cols]
             .apply(lambda g: slope_per_group(g, slope_cols))
@@ -149,10 +149,10 @@ def build_yearly_from_monthly(
     else:
         slopes = pd.DataFrame(index=last_vals.index)
 
-    # 披露次数
+    # Observation count
     obs = dfw.groupby(["permno", year_col]).size().rename("obs_count_in_year").to_frame()
 
-    # 组合年度特征
+    # Combine yearly features
     yearly = (
         last_vals.join(mean_vals, how="outer")
         .join(std_vals, how="outer")
@@ -161,9 +161,9 @@ def build_yearly_from_monthly(
         .reset_index()
     )
 
-    # 生成“下一年”标签：按公司→年去重排序后 shift(-1)
+    # Generate "next year" label: deduplicate by company->year, sort, then shift(-1)
     if "delist" not in dfw.columns:
-        raise ValueError("数据缺少 delist 列，无法构造下一年标签 y_next_year。")
+        raise ValueError("Data missing delist column, cannot construct next year label y_next_year.")
     label_year = (
         dfw[["permno", year_col, "delist"]]
         .drop_duplicates(subset=["permno", year_col])
@@ -177,11 +177,11 @@ def build_yearly_from_monthly(
         how="left",
     )
 
-    # 仅保留存在下一年标签的行
+    # Only keep rows with next year labels
     yearly = yearly[yearly["y_next_year"].notna()].copy()
     yearly["y_next_year"] = yearly["y_next_year"].astype(int)
 
-    # 统一列名期望
+    # Standardize column name expectations
     if year_col != "public_year":
         yearly = yearly.rename(columns={year_col: "public_year"})
     return yearly
@@ -194,19 +194,19 @@ def company_level_split_by_ipo(
     year_col: str = "public_year",
     ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
 ) -> pd.Series:
-    """公司级切分：按公司 IPO 时间（若无则用首个年份）全量分配到 train/val/test。
-    满足“同一公司的所有年份仅位于一个集合”，并按公司时间先后顺序分层。
-    返回与 df 等长的 pd.Series，值为 train/val/test。
+    """Company-level split: assign all years of each company to train/val/test based on IPO time (or first year if unavailable).
+    Ensures "all years of the same company are in only one set", and stratifies by company chronological order.
+    Returns pd.Series of same length as df with values train/val/test.
     """
     r_train, r_val, r_test = ratios
     if not np.isclose(r_train + r_val + r_test, 1.0):
-        raise ValueError("ratios 之和必须为 1.0")
+        raise ValueError("ratios must sum to 1.0")
     if company_col not in df.columns:
-        raise ValueError(f"缺少分组列 {company_col}")
+        raise ValueError(f"Missing grouping column {company_col}")
     if year_col not in df.columns:
-        raise ValueError(f"缺少年份列 {year_col}")
+        raise ValueError(f"Missing year column {year_col}")
 
-    # 计算公司级排序键
+    # Calculate company-level sort key
     comp = df[[company_col, year_col]].drop_duplicates().copy()
     if ipo_col and ipo_col in df.columns:
         ipo_key = (
@@ -216,20 +216,20 @@ def company_level_split_by_ipo(
             .drop_duplicates(subset=[company_col], keep="first")
         )
         comp = comp.merge(ipo_key, on=company_col, how="left")
-        # 若少数公司无 ipodate，用其最早年份的 1 月作为近似
+        # If some companies lack ipodate, use January of their earliest year as approximation
         comp["_sort_key"] = comp[ipo_col]
         if comp["_sort_key"].isna().any():
             fallback = (
                 df.groupby(company_col)[year_col].min().rename("_first_year").to_frame()
             )
             comp = comp.merge(fallback, on=company_col, how="left")
-            # 构造一个可比较的日期：_first_year-01-01
+            # Construct a comparable date: _first_year-01-01
             comp.loc[comp["_sort_key"].isna(), "_sort_key"] = pd.to_datetime(
                 comp.loc[comp["_sort_key"].isna(), "_first_year"].astype(int).astype(str) + "-01-01",
                 errors="coerce",
             )
     else:
-        # 没有 ipodate，就用公司最早年份作为排序键
+        # No ipodate, use company's earliest year as sort key
         comp_key = df.groupby(company_col)[year_col].min().rename("_first_year").to_frame()
         comp = comp.merge(comp_key, on=company_col, how="left")
         comp["_sort_key"] = pd.to_datetime(
@@ -248,7 +248,7 @@ def company_level_split_by_ipo(
     comp.iloc[i1:i2, comp.columns.get_loc("split")] = "val"
     comp.iloc[i2:, comp.columns.get_loc("split")] = "test"
 
-    # 映射回原 df
+    # Map back to original df
     tag_map = comp[[company_col, "split"]]
     out = df[[company_col]].merge(tag_map, on=company_col, how="left")["split"]
     out.index = df.index
@@ -261,22 +261,22 @@ def chronological_group_split(
     time_col: str,
     ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
 ) -> pd.Series:
-    """为每行返回 split 标记：train/val/test（按每个 group 的时间先后顺序切分）。"""
+    """Return split tag for each row: train/val/test (split by chronological order within each group)."""
     r_train, r_val, r_test = ratios
     if not np.isclose(r_train + r_val + r_test, 1.0):
-        raise ValueError("ratios 之和必须为 1.0")
+        raise ValueError("ratios must sum to 1.0")
 
     splits = []
     for _, g in df.groupby(group_col, sort=False):
-        # 若存在 public_month，且使用 public_year 作为时间列，则进行两级排序
+        # If public_month exists and using public_year as time column, perform two-level sort
         if time_col == "public_year" and "public_month" in g.columns:
             g_sorted = g.sort_values([time_col, "public_month"], kind="mergesort")
         else:
-            g_sorted = g.sort_values(time_col, kind="mergesort")  # 稳定排序
+            g_sorted = g.sort_values(time_col, kind="mergesort")  # Stable sort
         n = len(g_sorted)
         i1 = int(np.floor(n * r_train))
         i2 = int(np.floor(n * (r_train + r_val)))
-        # 边界保护：确保至少把最后一条留在 test（若样本数足够）
+        # Boundary protection: ensure at least the last record stays in test (if sample size sufficient)
         i1 = min(max(i1, 0), max(n - 2, 0))
         i2 = min(max(i2, i1 + 1), max(n - 1, 1))
         tags = np.array(["train"] * n, dtype=object)
@@ -293,17 +293,17 @@ def build_feature_matrix(
     missing = [c for c in features if c not in df.columns]
     if not present:
         raise ValueError(
-            f"指定的特征均不存在于数据中。缺失示例：{missing[:5]}。请用 --features 指定正确列名。"
+            f"None of the specified features exist in the data. Missing examples: {missing[:5]}. Please specify correct column names via --features."
         )
     if missing:
-        print(f"[警告] 下列特征在数据中未找到，将被忽略：{', '.join(missing)}")
+        print(f"[Warning] The following features were not found in data and will be ignored: {', '.join(missing)}")
     return df[present], present
 
 
 def sanitize_feature_df(
     X: pd.DataFrame, drop_zero_variance: bool = True
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """将特征转为数值、替换 inf/-inf 为 NaN，并可选移除全 NaN/零方差列。"""
+    """Convert features to numeric, replace inf/-inf with NaN, and optionally remove all-NaN/zero-variance columns."""
     X_numeric = X.apply(pd.to_numeric, errors="coerce")
     X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
 
@@ -312,14 +312,14 @@ def sanitize_feature_df(
     if all_nan_cols:
         dropped.extend(all_nan_cols)
         X_numeric = X_numeric.drop(columns=all_nan_cols)
-        print(f"[警告] 下列特征列全为缺失，已移除：{', '.join(all_nan_cols)}")
+        print(f"[Warning] The following feature columns are all missing and have been removed: {', '.join(all_nan_cols)}")
 
     if drop_zero_variance:
         zero_var_cols = [c for c in X_numeric.columns if X_numeric[c].nunique(dropna=True) <= 1]
         if zero_var_cols:
             dropped.extend(zero_var_cols)
             X_numeric = X_numeric.drop(columns=zero_var_cols)
-            print(f"[提示] 下列特征列零方差/常数列，已移除：{', '.join(zero_var_cols)}")
+            print(f"[Info] The following zero-variance/constant feature columns have been removed: {', '.join(zero_var_cols)}")
 
     return X_numeric, dropped
 
@@ -330,52 +330,52 @@ def parse_args() -> argparse.Namespace:
         "--data_path",
         type=str,
         default=os.path.join("data", "final_table_merged.xlsx"),
-        help="数据文件路径（Excel）",
+        help="Data file path (Excel)",
     )
-    parser.add_argument("--model_name", type=str, default="logistic_regression", help="模型名称")
-    parser.add_argument("--label_col", type=str, default="delist", help="标签列名（0/1 是否退市）")
-    parser.add_argument("--group_col", type=str, default="permno", help="分组列名（公司 id）")
-    parser.add_argument("--time_col", type=str, default="public_year", help="年份列名")
+    parser.add_argument("--model_name", type=str, default="logistic_regression", help="Model name")
+    parser.add_argument("--label_col", type=str, default="delist", help="Label column name (0/1 delist indicator)")
+    parser.add_argument("--group_col", type=str, default="permno", help="Grouping column name (company id)")
+    parser.add_argument("--time_col", type=str, default="public_year", help="Year column name")
     parser.add_argument(
         "--features",
         type=str,
         default=None,
-        help="逗号分隔的特征列名；若不提供则使用内置默认并与数据列求交集",
+        help="Comma-separated feature column names; if not provided, use built-in defaults and intersect with data columns",
     )
-    # 模型相关可调参数
+    # Model-related tunable parameters
     parser.add_argument(
         "--C",
         type=float,
         default=1.0,
-        help="LogisticRegression 的正则强度的倒数（越大越弱正则）",
+        help="Inverse of regularization strength for LogisticRegression (larger = weaker regularization)",
     )
     parser.add_argument(
         "--max_iter",
         type=int,
         default=1000,
-        help="LogisticRegression 的最大迭代次数",
+        help="Maximum iterations for LogisticRegression",
     )
     parser.add_argument(
         "--predict_next_year",
         action="store_true",
-        help="启用年度聚合：使用当年（聚合后）特征预测下一年是否退市（生成 y_next_year）",
+        help="Enable yearly aggregation: use current year (aggregated) features to predict next year delist (generates y_next_year)",
         default=True,
     )
     parser.add_argument(
         "--cutoff_month",
         type=int,
         default=None,
-        help="年度聚合的截止月份（仅保留当年 <= cutoff_month 的月度观测；默认 None 表示使用全年信息）",
+        help="Cutoff month for yearly aggregation (only keep monthly observations <= cutoff_month in current year; default None means use full year)",
     )
-    parser.add_argument("--train_ratio", type=float, default=0.7, help="训练集比例")
-    parser.add_argument("--val_ratio", type=float, default=0.15, help="验证集比例")
-    parser.add_argument("--test_ratio", type=float, default=0.15, help="测试集比例")
-    parser.add_argument("--random_state", type=int, default=42, help="随机种子")
-    parser.add_argument("--save_model_path", type=str, default=None, help="模型保存路径")
+    parser.add_argument("--train_ratio", type=float, default=0.7, help="Training set ratio")
+    parser.add_argument("--val_ratio", type=float, default=0.15, help="Validation set ratio")
+    parser.add_argument("--test_ratio", type=float, default=0.15, help="Test set ratio")
+    parser.add_argument("--random_state", type=int, default=42, help="Random seed")
+    parser.add_argument("--save_model_path", type=str, default=None, help="Model save path")
     parser.add_argument(
         "--drop_zero_variance",
         action="store_true",
-        help="移除零方差特征列（常数列）以提升鲁棒性",
+        help="Remove zero-variance feature columns (constant columns) to improve robustness",
     )
     return parser.parse_args()
 
@@ -383,13 +383,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # 读取数据
+    # Read data
     df = pd.read_excel(args.data_path)
 
-    # 若启用“用今年预测下一年”，先将月度数据聚合为年度并构造 y_next_year
+    # If "predict next year using current year" is enabled, first aggregate monthly data to yearly and construct y_next_year
     if bool(args.predict_next_year):
         df = build_yearly_from_monthly(df, cutoff_month=args.cutoff_month)
-        # 覆盖为年度任务的列名
+        # Override column names for yearly task
         args.label_col = "y_next_year"
         args.time_col = "public_year"
     else:
@@ -398,7 +398,7 @@ def main() -> None:
         if args.label_col is None:
             args.label_col = infer_label_column(df.columns)
 
-    # 选择特征
+    # Select features
     if args.features:
         feat_list = [x.strip() for x in args.features.split(",") if x.strip()]
     else:
@@ -409,13 +409,13 @@ def main() -> None:
         )
 
     X_df, selected_features = build_feature_matrix(df, feat_list)
-    # 清洗特征，替换无穷/异常为 NaN，删除全 NaN/零方差列
+    # Clean features: replace inf/abnormal values with NaN, remove all-NaN/zero-variance columns
     X_df, dropped_cols = sanitize_feature_df(X_df, drop_zero_variance=bool(args.drop_zero_variance))
     if dropped_cols:
         selected_features = [c for c in selected_features if c not in dropped_cols]
     y = df[args.label_col].astype(int).values
 
-    # 构造 split
+    # Construct split
     splits = chronological_group_split(
         df=df,
         group_col=args.group_col,
@@ -423,7 +423,7 @@ def main() -> None:
         ratios=(args.train_ratio, args.val_ratio, args.test_ratio),
     )
 
-    # 若启用年度预测下一年，优先采用“公司级（按 IPO/首年）”切分，避免同一公司跨集合
+    # If yearly prediction enabled, prefer "company-level (by IPO/first year)" split to avoid same company across sets
     if bool(args.predict_next_year):
         splits = company_level_split_by_ipo(
             df=df,
@@ -433,7 +433,7 @@ def main() -> None:
             ratios=(args.train_ratio, args.val_ratio, args.test_ratio),
         )
 
-    # 切分数据
+    # Split data
     train_idx = splits == "train"
     val_idx = splits == "val"
     test_idx = splits == "test"
@@ -445,23 +445,23 @@ def main() -> None:
     X_test = X_df.loc[test_idx].values
     y_test = y[test_idx.values]
 
-    # 训练集类别检查：若仅有单一类别，尝试从 val/test 引入含正类的公司
+    # Training set class check: if only single class, try to introduce companies with positive class from val/test
     def _has_two_classes(arr: np.ndarray) -> bool:
         u = np.unique(arr)
         return u.size >= 2
 
     if not _has_two_classes(y_train):
-        # 找出 val/test 中有哪些公司带正类
+        # Find which companies in val/test have positive class
         company_col = args.group_col
         need_pos = 1 if (len(np.unique(y_train)) == 1 and np.unique(y_train)[0] == 0) else 0
-        # 从 val 优先寻找
+        # Prefer searching from val
         candidate_val_companies = df.loc[val_idx & (df[args.label_col] == 1), company_col].unique().tolist()
         candidate_test_companies = df.loc[test_idx & (df[args.label_col] == 1), company_col].unique().tolist()
         moved = False
         for comp_list in [candidate_val_companies, candidate_test_companies]:
             if comp_list:
                 comp_to_move = comp_list[0]
-                # 将该公司的全部样本标记为 train
+                # Mark all samples of this company as train
                 splits.loc[(df[company_col] == comp_to_move)] = "train"
                 train_idx = splits == "train"
                 val_idx = splits == "val"
@@ -474,14 +474,14 @@ def main() -> None:
                 y_test = y[test_idx.values]
                 if _has_two_classes(y_train):
                     moved = True
-                    print(f"[提示] 训练集仅含单一类别，已将公司 {comp_to_move} 从验证/测试移动到训练以确保可训练。")
+                    print(f"[Info] Training set contains only single class, moved company {comp_to_move} from validation/test to training to ensure trainability.")
                     break
         if not moved and not _has_two_classes(y_train):
-            raise ValueError("训练集仅含单一类别，且在验证/测试集中找不到正类公司用于调整。请检查数据或修改切分比例。")
+            raise ValueError("Training set contains only single class and no positive class companies found in validation/test sets for adjustment. Please check data or modify split ratios.")
 
-    # 模型构建
+    # Model construction
     if args.model_name != "logistic_regression":
-        raise ValueError("目前仅支持 model_name=logistic_regression")
+        raise ValueError("Currently only model_name=logistic_regression is supported")
     model = build_model_from_params(
         {
             "random_state": args.random_state,
@@ -490,7 +490,7 @@ def main() -> None:
         }
     )
 
-    # 训练前信息：样本规模与类别分布、参数与流水线
+    # Pre-training info: sample size and class distribution, parameters and pipeline
     def _dist(name: str, y_arr: np.ndarray) -> str:
         if y_arr.size == 0:
             return f"{name}: 0"
@@ -502,53 +502,53 @@ def main() -> None:
     print(_dist("Val", y_val))
     print(_dist("Test", y_test))
     try:
-        print("模型参数:", model.get_params())
+        print("Model parameters:", model.get_params())
     except Exception:
         pass
     try:
-        # 简要打印流水线步骤名（组件内部参数较多，保持简洁）
+        # Briefly print pipeline step names (components have many internal parameters, keep it simple)
         from pprint import pprint
         if getattr(model, "pipeline", None) is not None:
-            print("流水线步骤:", [name for name, _ in model.pipeline.steps])
+            print("Pipeline steps:", [name for name, _ in model.pipeline.steps])
     except Exception:
         pass
 
-    # 训练
-    print("[训练] 开始训练模型...")
+    # Training
+    print("[Training] Starting model training...")
     model.fit(X_train, y_train)
-    print("[训练] 训练完成")
+    print("[Training] Training completed")
 
-    # 评估
+    # Evaluation
     val_metrics = model.evaluate(X_val, y_val)
     test_metrics = model.evaluate(X_test, y_test)
 
-    print("验证集指标:", val_metrics)
-    print("测试集指标:", test_metrics)
-    print(f"使用特征（{len(selected_features)}）: {', '.join(selected_features)}")
+    print("Validation set metrics:", val_metrics)
+    print("Test set metrics:", test_metrics)
+    print(f"Features used ({len(selected_features)}): {', '.join(selected_features)}")
 
-    # 显示当前模型参数（系数与截距）
+    # Display current model parameters (coefficients and intercept)
     try:
         clf = model.pipeline.named_steps["clf"]  # type: ignore
         coef = getattr(clf, "coef_", None)
         intercept = getattr(clf, "intercept_", None)
         if coef is not None:
             coef = np.asarray(coef).reshape(-1)
-            # 对齐特征名
+            # Align feature names
             feature_coefs = list(zip(selected_features, coef))
-            # 取绝对值前 15 个
+            # Top 15 by absolute value
             topk = sorted(feature_coefs, key=lambda x: abs(x[1]), reverse=True)[:15]
-            print("截距(intercept):", float(intercept[0]) if intercept is not None else "N/A")
-            print("权重 Top-15 (按|coef|排序):")
+            print("Intercept:", float(intercept[0]) if intercept is not None else "N/A")
+            print("Top-15 weights (sorted by |coef|):")
             for name, w in topk:
                 print(f"  {name}: {w:.6f}")
     except Exception:
         pass
 
-    # 保存模型
+    # Save model
     if args.save_model_path:
         os.makedirs(os.path.dirname(args.save_model_path), exist_ok=True)
         model.save(args.save_model_path)
-        print(f"模型已保存到: {args.save_model_path}")
+        print(f"Model saved to: {args.save_model_path}")
 
 
 if __name__ == "__main__":

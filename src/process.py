@@ -11,23 +11,23 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 def _read_excel_safely(path: str) -> pd.DataFrame:
     """
-    读取 Excel 或 CSV（如果 Excel 失败则尝试 CSV）。
+    Read Excel or CSV (fallback to CSV if Excel fails).
     """
     if not os.path.exists(path):
-        raise FileNotFoundError(f"文件不存在: {path}")
+        raise FileNotFoundError(f"File does not exist: {path}")
     ext = os.path.splitext(path)[1].lower()
     if ext == ".xlsx":
         try:
             return pd.read_excel(path)
         except Exception:
-            # 回退到同名 CSV
+            # Fallback to CSV with same name
             csv_path = os.path.splitext(path)[0] + ".csv"
             if os.path.exists(csv_path):
                 return pd.read_csv(csv_path)
             raise
     if ext == ".csv":
         return pd.read_csv(path)
-    # 其他后缀也尝试用 pandas 读
+    # For other extensions, also try reading with pandas
     return pd.read_excel(path)
 
 
@@ -37,32 +37,32 @@ def _to_datetime(series: pd.Series) -> pd.Series:
 
 def _standardize_ipo_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    将 IPO 表标准化为列: permno, comnam, ticker, ipo_date, exchcd, shrcd
-    兼容列名: {permno, comnam, ticker, namedt/ipo_date, exchcd, shrcd}
+    Standardize IPO table to columns: permno, comnam, ticker, ipo_date, exchcd, shrcd
+    Compatible column names: {permno, comnam, ticker, namedt/ipo_date, exchcd, shrcd}
     """
     columns_lower = {c.lower(): c for c in df.columns}
     col = lambda name: columns_lower.get(name)
 
     out = pd.DataFrame()
     if col("permno") is None:
-        raise ValueError("IPO 表缺少 permno 列")
+        raise ValueError("IPO table missing permno column")
     out["permno"] = df[col("permno")]
 
-    # 公司名
+    # Company name
     name_col = col("comnam") or col("comnamename") or col("companyname")
     out["comnam"] = df[name_col] if name_col else None
 
-    # 代码
+    # Ticker
     ticker_col = col("ticker") or col("ncusip") or col("cusip8")
     out["ticker"] = df[ticker_col] if ticker_col else None
 
-    # IPO 日期
+    # IPO date
     ipo_col = col("ipo_date") or col("namedt")
     if ipo_col is None:
-        raise ValueError("IPO 表缺少 ipo_date/namedt 列")
+        raise ValueError("IPO table missing ipo_date/namedt column")
     out["ipo_date"] = _to_datetime(df[ipo_col])
 
-    # exchcd/shrcd（可选）
+    # exchcd/shrcd (optional)
     if col("exchcd"):
         out["exchcd"] = df[col("exchcd")]
     if col("shrcd"):
@@ -73,32 +73,32 @@ def _standardize_ipo_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _standardize_delist_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    将 Delist 表标准化为列: permno, comnam, ticker, delist_date, exchcd, shrcd
-    兼容列名: {permno, comnam, ticker, nameendt/delist_date/dlstdt, exchcd, shrcd}
+    Standardize Delist table to columns: permno, comnam, ticker, delist_date, exchcd, shrcd
+    Compatible column names: {permno, comnam, ticker, nameendt/delist_date/dlstdt, exchcd, shrcd}
     """
     columns_lower = {c.lower(): c for c in df.columns}
     col = lambda name: columns_lower.get(name)
 
     out = pd.DataFrame()
     if col("permno") is None:
-        raise ValueError("Delist 表缺少 permno 列")
+        raise ValueError("Delist table missing permno column")
     out["permno"] = df[col("permno")]
 
-    # 公司名
+    # Company name
     name_col = col("comnam") or col("comnamename") or col("companyname")
     out["comnam_delist"] = df[name_col] if name_col else None
 
-    # 代码
+    # Ticker
     ticker_col = col("ticker") or col("ncusip") or col("cusip8")
     out["ticker_delist"] = df[ticker_col] if ticker_col else None
 
-    # 退市日期优先顺序: delist_date > nameendt > dlstdt
+    # Delist date priority order: delist_date > nameendt > dlstdt
     date_col = col("delist_date") or col("nameendt") or col("dlstdt")
     if date_col is None:
-        raise ValueError("Delist 表缺少 delist_date/nameendt/dlstdt 列")
+        raise ValueError("Delist table missing delist_date/nameendt/dlstdt column")
     out["delist_date"] = _to_datetime(df[date_col])
 
-    # exchcd/shrcd（可选）
+    # exchcd/shrcd (optional)
     if col("exchcd"):
         out["exchcd_delist"] = df[col("exchcd")]
     if col("shrcd"):
@@ -120,10 +120,10 @@ def process(
     years: int = 5,
 ) -> pd.DataFrame:
     """
-    读取 IPO 与 Delist 数据，按 `permno` 合并，筛选 IPO 后 `years` 年内退市的公司。
+    Read IPO and Delist data, merge by `permno`, filter companies that delisted within `years` years after IPO.
 
-    返回列包含：permno, comnam, ticker, ipo_date, delist_date, 以及可用的 exchcd/shrcd。
-    若提供 output_path，保存为 .xlsx（若失败回退 .csv）。
+    Return columns include: permno, comnam, ticker, ipo_date, delist_date, and available exchcd/shrcd.
+    If output_path provided, save as .xlsx (fallback to .csv if fails).
     """
     ipo_df_raw = _read_excel_safely(ipo_path)
     delist_df_raw = _read_excel_safely(delist_path)
@@ -131,18 +131,18 @@ def process(
     ipo_df = _standardize_ipo_columns(ipo_df_raw)
     delist_df = _standardize_delist_columns(delist_df_raw)
 
-    # 按 permno 合并，每个 permno 取一条 IPO（假设输入已去重）与一条 Delist（假设输入已去重）
+    # Merge by permno, take one IPO per permno (assume input deduplicated) and one Delist per permno (assume input deduplicated)
     merged = pd.merge(ipo_df, delist_df, on="permno", how="inner")
 
-    # 统一公司名/代码优先 IPO 端
+    # Unify company name/ticker, prefer IPO side
     merged["comnam_final"] = merged["comnam"].fillna(merged.get("comnam_delist"))
     merged["ticker_final"] = merged["ticker"].fillna(merged.get("ticker_delist"))
 
-    # 筛选 IPO 至多 years 年内退市
+    # Filter companies that delisted within at most years years after IPO
     mask = _within_years(merged["ipo_date"], merged["delist_date"], years)
     filtered = merged.loc[mask].copy()
 
-    # 输出所需列
+    # Output required columns
     cols = [
         "permno",
         "comnam_final",
@@ -168,7 +168,7 @@ def process(
             else:
                 result.to_csv(output_path, index=False)
         except Exception:
-            # 回退到 CSV
+            # Fallback to CSV
             fallback = os.path.splitext(output_path)[0] + ".csv"
             result.to_csv(fallback, index=False)
 
@@ -176,34 +176,34 @@ def process(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="筛选 IPO 后 N 年内退市的公司")
+    parser = argparse.ArgumentParser(description="Filter companies that delisted within N years after IPO")
     parser.add_argument(
         "--ipo-path",
         dest="ipo_path",
         type=str,
         default=os.path.join(DATA_DIR, "ipo_1974_2024_2.xlsx"),
-        help="IPO 数据文件路径（.xlsx 或 .csv）",
+        help="IPO data file path (.xlsx or .csv)",
     )
     parser.add_argument(
         "--delist-path",
         dest="delist_path",
         type=str,
         default=os.path.join(DATA_DIR, "delist_1974_2024_2.xlsx"),
-        help="退市数据文件路径（.xlsx 或 .csv）",
+        help="Delist data file path (.xlsx or .csv)",
     )
     parser.add_argument(
         "--output-path",
         dest="output_path",
         type=str,
         default=os.path.join(DATA_DIR, "ipo_delist_within5y_1974_2024_2.xlsx"),
-        help="输出保存路径（.xlsx 或 .csv，可选）",
+        help="Output save path (.xlsx or .csv, optional)",
     )
     parser.add_argument(
         "--years",
         dest="years",
         type=int,
         default=5,
-        help="IPO 后多少年内退市（默认 5）",
+        help="Within how many years after IPO to delist (default 5)",
     )
     args = parser.parse_args()
 
@@ -213,6 +213,6 @@ if __name__ == "__main__":
         output_path=args.output_path,
         years=args.years,
     )
-    print(f"筛选结果行数: {len(df_out)}")
+    print(f"Filtered result row count: {len(df_out)}")
     print(df_out.head(10))
 

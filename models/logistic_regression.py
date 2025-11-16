@@ -24,12 +24,12 @@ class LogisticRegressionConfig:
 
     C: float = 1.0
     penalty: str = "l2"
-    solver: str = "lbfgs"  # 使用 lbfgs 以支持 warm_start 和进度条
+    solver: str = "lbfgs"  # Use lbfgs to support warm_start and progress bar
     max_iter: int = 1000
     class_weight: Optional[Dict[int, float] | str] = "balanced"
     random_state: int = 42
     verbose: int = 0
-    warm_start: bool = True  # 启用 warm_start 以支持进度条显示
+    warm_start: bool = True  # Enable warm_start to support progress bar display
     # Preprocessing
     impute_strategy: str = "median"
     with_mean: bool = True
@@ -74,7 +74,7 @@ class LogisticRegressionModel:
         return self
 
     def fit_with_progress(self, X: np.ndarray, y: np.ndarray, step: int = 50) -> "LogisticRegressionModel":
-        """训练模型并使用 tqdm 显示进度条（通过 warm_start 模拟进度）。"""
+        """Train model and display progress bar using tqdm (simulate progress via warm_start)."""
         if self.pipeline is None:
             self._build_pipeline()
         
@@ -86,7 +86,7 @@ class LogisticRegressionModel:
         assert self.pipeline is not None
         clf: LogisticRegression = self.pipeline.named_steps["clf"]  # type: ignore
         
-        # 使用 warm_start 显示进度条（虽然不完美，但至少能看到训练进度）
+        # Use warm_start to display progress bar (not perfect, but at least can see training progress)
         if self.config.warm_start and self.config.solver in ["lbfgs", "newton-cg", "sag", "saga"]:
             total_iter = int(self.config.max_iter)
             clf.set_params(warm_start=True)
@@ -98,7 +98,7 @@ class LogisticRegressionModel:
                 clf.set_params(max_iter=int(m))
                 self.pipeline.fit(X, y)
         else:
-            # 不支持 warm_start，直接训练
+            # warm_start not supported, train directly
             if tqdm:
                 with tqdm(total=1, desc="Training") as pbar:
                     self.pipeline.fit(X, y)
