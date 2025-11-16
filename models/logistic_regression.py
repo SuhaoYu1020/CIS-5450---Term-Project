@@ -24,10 +24,12 @@ class LogisticRegressionConfig:
 
     C: float = 1.0
     penalty: str = "l2"
-    solver: str = "lbfgs"
+    solver: str = "lbfgs"  # 使用 lbfgs 以支持 warm_start 和进度条
     max_iter: int = 1000
     class_weight: Optional[Dict[int, float] | str] = "balanced"
     random_state: int = 42
+    verbose: int = 0
+    warm_start: bool = True  # 启用 warm_start 以支持进度条显示
     # Preprocessing
     impute_strategy: str = "median"
     with_mean: bool = True
@@ -57,6 +59,8 @@ class LogisticRegressionModel:
                         max_iter=self.config.max_iter,
                         class_weight=self.config.class_weight,
                         random_state=self.config.random_state,
+                        verbose=self.config.verbose,
+                        warm_start=self.config.warm_start,
                     ),
                 ),
             ]
@@ -67,6 +71,41 @@ class LogisticRegressionModel:
         if self.pipeline is None:
             self._build_pipeline()
         self.pipeline.fit(X, y)
+        return self
+
+    def fit_with_progress(self, X: np.ndarray, y: np.ndarray, step: int = 50) -> "LogisticRegressionModel":
+        """训练模型并使用 tqdm 显示进度条（通过 warm_start 模拟进度）。"""
+        if self.pipeline is None:
+            self._build_pipeline()
+        
+        try:
+            from tqdm import tqdm  # type: ignore
+        except Exception:
+            tqdm = None
+        
+        assert self.pipeline is not None
+        clf: LogisticRegression = self.pipeline.named_steps["clf"]  # type: ignore
+        
+        # 使用 warm_start 显示进度条（虽然不完美，但至少能看到训练进度）
+        if self.config.warm_start and self.config.solver in ["lbfgs", "newton-cg", "sag", "saga"]:
+            total_iter = int(self.config.max_iter)
+            clf.set_params(warm_start=True)
+            iters = list(range(step, total_iter + 1, step))
+            if iters[-1] != total_iter:
+                iters.append(total_iter)
+            iterable = tqdm(iters, desc="Training", unit="iter") if tqdm else iters
+            for m in iterable:
+                clf.set_params(max_iter=int(m))
+                self.pipeline.fit(X, y)
+        else:
+            # 不支持 warm_start，直接训练
+            if tqdm:
+                with tqdm(total=1, desc="Training") as pbar:
+                    self.pipeline.fit(X, y)
+                    pbar.update(1)
+            else:
+                self.pipeline.fit(X, y)
+        
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
